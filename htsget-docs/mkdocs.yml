@@ -1,0 +1,5 @@
+site_name: htsget-docs
+nav:
+    - Home: index.md
+    - Endpoints: endpoints.md
+theme: readthedocs

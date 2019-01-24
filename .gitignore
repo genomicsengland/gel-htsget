@@ -1,0 +1,8 @@
+.idea/
+**/*.pyc
+build/
+.Rhistory
+dist
+.env
+htsget.egg-info
+**/_trial_temp/

@@ -16,7 +16,7 @@
 
 * **Variants** - `GET /variants/{study_id}/{vcf_type}/{sample_id}`
     - This endpoint allows access to variant data (VCF)
-    - The URL parameter `vcf_type` refers to the type of data stored in the VCF (STR, CNV, SV, small_variant, family, somatic) 
+    - The URL parameter `vcf_type` refers to the type of data stored in the VCF (STR, CNV, SV, SMALL_VARIANT, FAMILY, SOMATIC) 
 
 
 ## Query parameters

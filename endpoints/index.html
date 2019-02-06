@@ -116,6 +116,15 @@
 </ul>
 <hr />
 <ul>
+<li><strong>Token Refresh</strong> - <code>POST /user/refresh-token</code><ul>
+<li>Given a LDAP username and a password (<code>{"username": "USER", "token": "TOKEN"}</code>), returns a session ID.</li>
+<li>This token is passed in the header of the GET requests to access the genomic data.</li>
+<li>Authentication and authorisation are managed by <a href="http://docs.opencb.org/display/opencga">OpenCGA</a>.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<ul>
 <li><strong>Reads</strong> - <code>GET /reads/{study_id}/{sample_id}</code><ul>
 <li>This endpoint allows access to read data (BAM)</li>
 </ul>

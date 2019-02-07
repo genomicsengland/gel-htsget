@@ -1,8 +1,9 @@
 import sys
 import json
 import yaml
-
 from tornado import ioloop, web
+
+from htsget.index import Index, Header
 
 from pyCGA.opencgarestclients import OpenCGAClient
 
@@ -44,8 +45,25 @@ class BaseHandler(web.RequestHandler):
         self.oc = None
         self.config = kwargs['config']
 
+    def options(self):
+        method = self.request.headers.get('Access-Control-Request-Method', '')
+        if method and method == 'GET':
+            self.set_header('Access-Control-Max-Age', 2592000)
+            headers = self.request.headers.get('Access-Control-Request-Headers', '')
+            if headers:
+                self.set_header('Access-Control-Allow-Headers', headers)
+        self.set_status(204)
+        self.finish()
+
+    def set_default_headers(self):
+        origin = self.request.headers.get('Origin', '')
+        if origin:
+            self.set_header('Access-Control-Allow-Origin', origin)
+        self.set_header('Content-Type', 'application/vnd.ga4gh.htsget.v1.1.1+json; charset=utf-8')
+        self.set_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+
     def write_error(self, status_code, **kwargs):
-        self.set_header('Content-Type', 'application/json')
+        # self.set_header('Content-Type', 'application/json')
         try:
             error, msg = self._reason.split('::')
         except Exception, e:
@@ -59,7 +77,7 @@ class BaseHandler(web.RequestHandler):
         }))
 
     @staticmethod
-    def get_session_id(auth_token):
+    def _get_session_id(auth_token):
         try:
             bearer, sid = auth_token.strip().split(' ')
             assert bearer == 'Bearer'
@@ -72,11 +90,14 @@ class BaseHandler(web.RequestHandler):
             if username and password:
                 self.oc = OpenCGAClient(configuration=self.config,
                                         user=username,
-                                        pwd=password)
-            elif auth_token:
-                session_id = self.get_session_id(auth_token)
+                                        pwd=password,
+                                        auto_refresh=False)
+            elif username and auth_token:
+                session_id = self._get_session_id(auth_token)
                 self.oc = OpenCGAClient(configuration=self.config,
-                                        session_id=session_id)
+                                        user=username,
+                                        session_id=session_id,
+                                        auto_refresh=False)
         except Exception, e:
             try:
                 msg = json.loads(e.message)['error']
@@ -85,10 +106,10 @@ class BaseHandler(web.RequestHandler):
             raise web.HTTPError(reason='InvalidAuthentication::' + msg,
                                 status_code=401)
 
-    def get_file_id(self, study, sample, bioformat, name, **kwargs):
+    def get_file_info(self, study, sample, bioformat, name, **kwargs):
         file_info = self.oc.files.search(
             study=study, samples=sample, bioformat=bioformat, name=name,
-            include='id', **kwargs
+            include='id,uri', **kwargs
         ).get()
         if not file_info:
             msg = 'NotFound::No file found for sample "{}" in study "{}"'
@@ -99,7 +120,27 @@ class BaseHandler(web.RequestHandler):
             raise web.HTTPError(reason=msg.format(sample, study, file_info),
                                 status_code=404)
         else:
-            return file_info[0]['id']
+            return file_info[0]
+
+    def check_arguments(self):
+        format = self.request.arguments.get('format', None)
+        ref = self.request.arguments.get('referenceName', None)
+        start = self.request.arguments.get('start', None)
+        end = self.request.arguments.get('end', None)
+
+        class_name = self.__class__.__name__
+        if format and class_name == 'ReadsHandler' and format[0] not in ['BAM']:
+            msg = 'InvalidInput::Requested format is not supported'
+            raise web.HTTPError(reason=msg, status_code=400)
+        if format and class_name == 'VariantsHandler' and format[0] not in ['VCF']:
+            msg = 'InvalidInput::Requested format is not supported'
+            raise web.HTTPError(reason=msg, status_code=400)
+        if (start or end) and (ref == '*' or not ref):
+            msg = 'InvalidInput::Coordinates are specified and either no reference is specified or referenceName is "*"'
+            raise web.HTTPError(reason=msg, status_code=400)
+        if start and end and int(start[0]) > int(end[0]):
+            msg = 'InvalidRange::Start greater than end'
+            raise web.HTTPError(reason=msg, status_code=400)
 
 
 class LoginHandler(BaseHandler):
@@ -121,54 +162,110 @@ class LoginHandler(BaseHandler):
             self.write({"sessionId": self.oc.session_id})
 
 
+class RefreshTokenHandler(BaseHandler):
+    def __init__(self, application, request, **kwargs):
+        super(RefreshTokenHandler, self).__init__(application, request, **kwargs)
+
+    def post(self):
+        username = self.get_argument('username', '')
+        token = self.get_argument('token', '')
+
+        if not username:
+            raise web.HTTPError(reason='InvalidInput::No username provided',
+                                status_code=400)
+        elif not token:
+            raise web.HTTPError(reason='InvalidInput::No token provided',
+                                status_code=400)
+        else:
+            self.opencga_login(username=username, auth_token=token)
+            self.write({"sessionId": self.oc.session_id})
+
+
 class ReadsHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(ReadsHandler, self).__init__(application, request, **kwargs)
         self.auth_token = self.request.headers.get('Authorization', '')
+        self.username = self.request.headers.get('username', '')
+
+    @staticmethod
+    def _get_bytes(bam_fpath, bai_fpath, ref, start, end):
+        header = Header.from_file(filename=bam_fpath)
+        index = Index.from_file(filename=bai_fpath)
+        try:
+            reference = header.refs.index(ref)
+        except Exception:
+            raise web.HTTPError(
+                reason='NotFound::Requested reference does not exist',
+                status_code=404
+            )
+
+        return [(i[0], i[0] + i[1])
+                for i in index.region_offset_iter(ref=reference,
+                                                  beg=start, end=end)]
+
+    @staticmethod
+    def _get_header_length(bai_fpath):
+        index = Index.from_file(filename=bai_fpath)
+        return index.header_length()
+
+    def _get_coordinates(self):
+        # TODO htsget specs
+        ref = self.request.arguments.get('referenceName', None)
+        start = self.request.arguments.get('start', None)
+        end = self.request.arguments.get('end', None)
+        return str(ref[0]), int(start[0]), int(end[0])
 
     def get(self, study, sample):
-        self.opencga_login(auth_token=self.auth_token)
+        self.check_arguments()
 
-        file_id = self.get_file_id(
+        self.opencga_login(username=self.username, auth_token=self.auth_token)
+
+        response = {"htsget": {"format": "BAM", "urls": []}}
+
+        # BAM info
+        bam_info = self.get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bam$',
             **{'attributes.gelStatus': 'READY'}
         )
+        bam_id = bam_info['id']
+        bam_fpath = bam_info['uri'].replace('file://', '')
 
+        # BAI info
+        bai_info = self.get_file_info(
+            study=study, sample=sample, bioformat='ALIGNMENT', name='~.bai$',
+            **{'attributes.gelStatus': 'READY'}
+        )
+        bai_fpath = bai_info['uri'].replace('file://', '')
+
+        # TODO remove debug code
+        bam_fpath = '/home/dgil/dev/gel-htsget/htsget/LP3001241-DNA_D06.mini.bam'  # DEBUG
+        bai_fpath = '/home/dgil/dev/gel-htsget/htsget/LP3001241-DNA_D06.bam.bai'  # DEBUG
+
+        # Header length
+        bam_header_length = self._get_header_length(bai_fpath)
+
+        # BAM body URL
         opencga_url = '{host}/webservices/rest/{version}/utils/ranges/{file_id}?study={study_id}'
-        url = opencga_url.format(host=self.config['rest']['hosts'][0],
-                                 version=self.config['version'],
-                                 file_id=file_id,
-                                 study_id=study)
-        print url
+        bam_body_url = opencga_url.format(host=self.config['rest']['hosts'][0],
+                                          version=self.config['version'],
+                                          file_id=bam_id,
+                                          study_id=study)
 
-        auth = self.auth_token
-        bam_header_url = 'XXX'
-        bam_body_url = 'YYY'
-        byte_range = 'Range ' + 'DDDD'
+        # BAM chunks byte range
+        ref, start, end = self._get_coordinates()
+        byte_range_list = self._get_bytes(bam_fpath, bai_fpath, ref, start, end)
 
-        response = {
-            'ID': sample,
-            'OPTIONS': self.request.arguments,
-            "htsget": {
-                "format": "BAM",
-                "urls": [
-                    {
-                        "url": bam_header_url,
-                        "headers": {
-                            "Authorization": auth,
-                            "Range": byte_range
-                        }
-                    },
-                    {
-                        "url": bam_body_url,
-                        "headers": {
-                            "Authorization": auth,
-                            "Range": byte_range
-                        }
-                    }
-                ]
-            }
-        }
+        bam_chunks = [
+            {
+                "url": bam_body_url,
+                "headers": {
+                    "Authorization": self.auth_token,
+                    "Range": 'bytes={}-{}'.format(byte_range[0], byte_range[1])
+                }
+            } for byte_range in [(1, bam_header_length)] + byte_range_list
+        ]
+        response['htsget']['urls'] = response['htsget']['urls'] + bam_chunks
+
         self.write(response)
 
 
@@ -179,6 +276,7 @@ class Htsget:
 
         self.application = web.Application([
             (r"/user/login", LoginHandler, dict(config=config)),
+            (r"/user/refresh-token", RefreshTokenHandler, dict(config=config)),
             (r"/reads/(.*)/(.*)", ReadsHandler, dict(config=config))
         ])
         self.application.listen(8888)

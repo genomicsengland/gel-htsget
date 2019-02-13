@@ -54,6 +54,7 @@ def reg2bins(beg, end):
 class Index(object):
     """
     Logical representation of a BAM Index.
+    https://github.com/LabAdvComp/python-bam/blob/master/bam/bai.py
     """
 
     def __init__(self):
@@ -432,94 +433,3 @@ class Bin(object):
         self.chunks = d['chunks']
 
         return self
-
-
-class Header(object):
-    """
-    BAM Header
-    https://github.com/LabAdvComp/python-bam/blob/master/bam/bam.py
-    """
-
-    def __init__(self):
-        self.refs = list()
-        self.lens = list()
-
-    @classmethod
-    def from_file(cls, filename=None, mode='rb', fileobj=None):
-
-        assert any([
-            filename is not None,
-            fileobj is not None,
-        ]), 'Must specify filename or fileobj.'
-
-        assert None in [
-            filename,
-            fileobj,
-        ], 'Filename and fileobj are mutually exclusive.'
-
-        ifs = fileobj if fileobj is not None else gzip.GzipFile(filename, mode)
-
-        self = cls()
-
-        try:
-
-            if ifs.read(4) != 'BAM\x01':
-                raise ValueError('BAM magic number not found')
-
-            hlen = deserialize('<i', ifs)
-            self.head = ifs.read(hlen)
-
-            if len(self.head) < hlen:
-                raise ValueError('BAM header is truncated')
-
-            # TODO once the SAM header is parsed, this can be changed to a map
-            rlen = deserialize('<i', ifs)
-            for i in range(rlen):
-                nlen = deserialize('<i', ifs)
-                name = deserialize('%dsx' % (nlen - 1), ifs)
-                size = deserialize('<i', ifs)
-
-                self.refs.append(name.decode('utf-8'))
-                self.lens.append(size)
-
-        except struct.error:
-
-            raise ValueError('BAM header is truncated')
-
-        return self
-
-    def to_file(self, filename=None, mode='wb', fileobj=None):
-
-        assert any([
-            filename is not None,
-            fileobj is not None,
-        ]), 'Must specify filename or fileobj.'
-
-        assert None in [
-            filename,
-            fileobj,
-        ], 'Filename and fileobj are mutually exclusive.'
-
-        ofs = fileobj if fileobj is not None else open(filename, mode)
-
-        ofs.write(self.to_bytes())
-
-    @classmethod
-    def from_bytes(cls, b):
-        raise NotImplementedError('TODO')
-
-    def to_bytes(self):
-
-        header = bytes()
-
-        header += b'BAM\x01'
-        header += struct.pack('<i', len(self.head))
-        header += self.head
-        header += struct.pack('<i', len(self.refs))
-        for r, l in zip(self.refs, self.lens):
-            header += struct.pack('<i', len(r) + 1)
-            header += struct.pack('<%ds' % len(r), r.encode('utf-8'))
-            header += b'\x00'
-            header += struct.pack('<i', l)
-
-        return header

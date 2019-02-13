@@ -10,8 +10,7 @@ reqs = [
 setup(
     name='htsget',
     version='0.1.0',
-    # packages=['htsget'],
-    scripts=['htsget.py'],
+    packages=['htsget_server'],
     url='',
     license='',
     include_package_data=True,

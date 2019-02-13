@@ -1,10 +1,12 @@
+import os
 import sys
 import json
 import yaml
+import requests
+from tempfile import NamedTemporaryFile
 from tornado import ioloop, web
 
-from htsget.index import Index, Header
-
+from index import Index
 from pyCGA.opencgarestclients import OpenCGAClient
 
 
@@ -122,6 +124,20 @@ class BaseHandler(web.RequestHandler):
         else:
             return file_info[0]
 
+    def download_file(self, file_id, study, auth_token, prefix='htsget',
+                      suffix='', _dir='/tmp', mode='wb', delete=True):
+        r = requests.get(
+            '{h}/webservices/rest/{v}/utils/ranges/{f}?study={s}&sid={sid}'.format(
+                h=self.config['rest']['hosts'][0], v=self.config['version'],
+                f=file_id, s=study, sid=self._get_session_id(auth_token)
+            )
+        )
+        ntf = NamedTemporaryFile(prefix=prefix, suffix=suffix, dir=_dir,
+                                 mode=mode, delete=delete)
+        ntf.write(r.content)
+        ntf.close()
+        return ntf.name
+
     def check_arguments(self):
         format = self.request.arguments.get('format', None)
         ref = self.request.arguments.get('referenceName', None)
@@ -188,11 +204,23 @@ class ReadsHandler(BaseHandler):
         self.username = self.request.headers.get('username', '')
 
     @staticmethod
-    def _get_bytes(bam_fpath, bai_fpath, ref, start, end):
-        header = Header.from_file(filename=bam_fpath)
+    def _get_header_length(bai_fpath):
+        index = Index.from_file(filename=bai_fpath)
+        return index.header_length()
+
+    def _get_refs(self, study, bam_id):
+        return [
+            ref['sequenceName']
+            for ref in self.oc.files.search(
+                study=study, id=bam_id
+            ).get()[0]['attributes']['alignmentHeader']['sequenceDiccionary']
+        ]
+
+    @staticmethod
+    def _get_bytes(bai_fpath, refs, ref, start, end):
         index = Index.from_file(filename=bai_fpath)
         try:
-            reference = header.refs.index(ref)
+            reference = refs.index(ref)
         except Exception:
             raise web.HTTPError(
                 reason='NotFound::Requested reference does not exist',
@@ -203,13 +231,7 @@ class ReadsHandler(BaseHandler):
                 for i in index.region_offset_iter(ref=reference,
                                                   beg=start, end=end)]
 
-    @staticmethod
-    def _get_header_length(bai_fpath):
-        index = Index.from_file(filename=bai_fpath)
-        return index.header_length()
-
     def _get_coordinates(self):
-        # TODO htsget specs
         ref = self.request.arguments.get('referenceName', None)
         start = self.request.arguments.get('start', None)
         end = self.request.arguments.get('end', None)
@@ -222,39 +244,35 @@ class ReadsHandler(BaseHandler):
 
         response = {"htsget": {"format": "BAM", "urls": []}}
 
-        # BAM info
-        bam_info = self.get_file_info(
+        # Getting BAM and BAI IDs
+        bam_id = self.get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bam$',
             **{'attributes.gelStatus': 'READY'}
-        )
-        bam_id = bam_info['id']
-        bam_fpath = bam_info['uri'].replace('file://', '')
-
-        # BAI info
-        bai_info = self.get_file_info(
+        )['id']
+        bai_id = self.get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bai$',
             **{'attributes.gelStatus': 'READY'}
+        )['id']
+
+        # BAM chunks byte range
+        refs = self._get_refs(study, bam_id)
+        ref, start, end = self._get_coordinates()
+        bai_fpath = self.download_file(
+            bai_id, study, self.auth_token, prefix='htsget-{}'.format(sample),
+            suffix='.bai', delete=False
         )
-        bai_fpath = bai_info['uri'].replace('file://', '')
-
-        # TODO remove debug code
-        bam_fpath = '/home/dgil/dev/gel-htsget/htsget/LP3001241-DNA_D06.mini.bam'  # DEBUG
-        bai_fpath = '/home/dgil/dev/gel-htsget/htsget/LP3001241-DNA_D06.bam.bai'  # DEBUG
-
-        # Header length
         bam_header_length = self._get_header_length(bai_fpath)
+        byte_range_list = self._get_bytes(bai_fpath, refs, ref, start, end)
+        os.unlink(bai_fpath)
 
-        # BAM body URL
+        # OpenCGA URL
         opencga_url = '{host}/webservices/rest/{version}/utils/ranges/{file_id}?study={study_id}'
         bam_body_url = opencga_url.format(host=self.config['rest']['hosts'][0],
                                           version=self.config['version'],
                                           file_id=bam_id,
                                           study_id=study)
 
-        # BAM chunks byte range
-        ref, start, end = self._get_coordinates()
-        byte_range_list = self._get_bytes(bam_fpath, bai_fpath, ref, start, end)
-
+        # Generating URLs
         bam_chunks = [
             {
                 "url": bam_body_url,
@@ -262,7 +280,10 @@ class ReadsHandler(BaseHandler):
                     "Authorization": self.auth_token,
                     "Range": 'bytes={}-{}'.format(byte_range[0], byte_range[1])
                 }
-            } for byte_range in [(1, bam_header_length)] + byte_range_list
+            } for byte_range in [(0, bam_header_length+65536)] + byte_range_list
+            # } for byte_range in [(0, bam_header_length+19558)] + byte_range_list
+        ] + [
+            {'url': 'data:application/vnd.ga4gh.bam;base64,H4sIBAAAAAAA/wYAQkMCABsAAwAAAAAAAAAAAA=='}  # EOF
         ]
         response['htsget']['urls'] = response['htsget']['urls'] + bam_chunks
 
@@ -291,7 +312,7 @@ class Htsget:
 
 
 def main():
-    htsget = Htsget(config='./htsget/opencga.json')
+    htsget = Htsget(config='./opencga.json')
     htsget.start()
 
 

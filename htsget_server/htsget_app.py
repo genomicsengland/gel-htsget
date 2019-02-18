@@ -111,7 +111,7 @@ class BaseHandler(web.RequestHandler):
     def get_file_info(self, study, sample, bioformat, name, **kwargs):
         file_info = self.oc.files.search(
             study=study, samples=sample, bioformat=bioformat, name=name,
-            include='id,uri', **kwargs
+            include='id,uri,size', **kwargs
         ).get()
         if not file_info:
             msg = 'NotFound::No file found for sample "{}" in study "{}"'
@@ -152,10 +152,15 @@ class BaseHandler(web.RequestHandler):
             msg = 'InvalidInput::Requested format is not supported'
             raise web.HTTPError(reason=msg, status_code=400)
         if (start or end) and (ref == '*' or not ref):
-            msg = 'InvalidInput::Coordinates are specified and either no reference is specified or referenceName is "*"'
+            msg = ('InvalidInput::Coordinates are specified and either no'
+                   ' reference is specified or referenceName is "*"')
             raise web.HTTPError(reason=msg, status_code=400)
         if start and end and int(start[0]) > int(end[0]):
             msg = 'InvalidRange::Start greater than end'
+            raise web.HTTPError(reason=msg, status_code=400)
+        if (start and not end) or (end and not start):
+            msg = ('InvalidInput::Both start and end coordinates must be'
+                   ' supplied')
             raise web.HTTPError(reason=msg, status_code=400)
 
 
@@ -217,25 +222,37 @@ class ReadsHandler(BaseHandler):
         ]
 
     @staticmethod
-    def _get_bytes(bai_fpath, refs, ref, start, end):
+    def _get_bytes(bai_fpath, bam_size, bam_header_length, refs, ref, start,
+                   end):
         index = Index.from_file(filename=bai_fpath)
-        try:
-            reference = refs.index(ref)
-        except Exception:
-            raise web.HTTPError(
-                reason='NotFound::Requested reference does not exist',
-                status_code=404
-            )
 
-        return [(i[0], i[0] + i[1])
-                for i in index.region_offset_iter(ref=reference,
-                                                  beg=start, end=end)]
+        if ref:
+            try:
+                reference = refs.index(ref)
+            except Exception:
+                raise web.HTTPError(
+                    reason='NotFound::Requested reference does not exist',
+                    status_code=404
+                )
+
+            byte_range_list = [
+                (i[0], i[0] + i[1])
+                for i in index.region_offset_iter(ref=reference, beg=start,
+                                                  end=end)
+            ]
+        else:
+            # Return all the file when no reference is specified
+            # TODO Do it by chunks or all at once?
+            byte_range_list = [(bam_header_length + 1, bam_size-1)]
+        return byte_range_list
 
     def _get_coordinates(self):
         ref = self.request.arguments.get('referenceName', None)
         start = self.request.arguments.get('start', None)
         end = self.request.arguments.get('end', None)
-        return str(ref[0]), int(start[0]), int(end[0])
+        return (str(ref[0]) if ref else None,
+                int(start[0]) if start else None,
+                int(end[0]) if end else None)
 
     def get(self, study, sample):
         self.check_arguments()
@@ -244,11 +261,13 @@ class ReadsHandler(BaseHandler):
 
         response = {"htsget": {"format": "BAM", "urls": []}}
 
-        # Getting BAM and BAI IDs
-        bam_id = self.get_file_info(
+        # Getting BAM ID, BAM size and BAI ID
+        bam_info = self.get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bam$',
             **{'attributes.gelStatus': 'READY'}
-        )['id']
+        )
+        bam_id = bam_info['id']
+        bam_size = bam_info['size']
         bai_id = self.get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bai$',
             **{'attributes.gelStatus': 'READY'}
@@ -261,8 +280,10 @@ class ReadsHandler(BaseHandler):
             bai_id, study, self.auth_token, prefix='htsget-{}'.format(sample),
             suffix='.bai', delete=False
         )
-        bam_header_length = self._get_header_length(bai_fpath)
-        byte_range_list = self._get_bytes(bai_fpath, refs, ref, start, end)
+        bam_header_length = self._get_header_length(bai_fpath) + 65536
+        byte_range_list = self._get_bytes(
+            bai_fpath, bam_size, bam_header_length, refs, ref, start, end
+        )
         os.unlink(bai_fpath)
 
         # OpenCGA URL
@@ -280,7 +301,7 @@ class ReadsHandler(BaseHandler):
                     "Authorization": self.auth_token,
                     "Range": 'bytes={}-{}'.format(byte_range[0], byte_range[1])
                 }
-            } for byte_range in [(0, bam_header_length+65536)] + byte_range_list
+            } for byte_range in [(0, bam_header_length)] + byte_range_list
             # } for byte_range in [(0, bam_header_length+19558)] + byte_range_list
         ] + [
             {'url': 'data:application/vnd.ga4gh.bam;base64,H4sIBAAAAAAA/wYAQkMCABsAAwAAAAAAAAAAAA=='}  # EOF

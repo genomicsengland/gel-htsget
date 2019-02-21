@@ -3,7 +3,8 @@ from setuptools import setup
 reqs = [
     'pyCGA==1.3.1',
     'tornado==5.1.1',
-    'pyyaml>=4.2b1'
+    'pyyaml>=4.2b1',
+    'pysam==0.15.2'
 ]
 
 

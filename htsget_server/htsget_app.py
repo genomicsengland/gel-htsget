@@ -1,13 +1,20 @@
-import os
 import sys
 import json
 import yaml
 import requests
 from tempfile import NamedTemporaryFile
-from tornado import ioloop, web
 
-from index import Index
+from tornado import ioloop, web
 from pyCGA.opencgarestclients import OpenCGAClient
+from pysam import AlignmentFile
+
+
+def _get_coordinates(args):
+    # Start: 0-based, inclusive. End: 0-based exclusive.
+    ref = str(args['referenceName']) if 'referenceName' in args else None
+    start = int(args['start']) + 1 if 'start' in args else None
+    end = int(args['end']) if 'end' in args else None
+    return ref, start, end
 
 
 class ConfigHandler:
@@ -38,7 +45,7 @@ class ConfigHandler:
         self.version = config_dict['version']
 
     def get_configuration(self):
-        return {"version": self.version, "rest": {"hosts": [self.host]}}
+        return {'version': self.version, 'rest': {'hosts': [self.host]}}
 
 
 class BaseHandler(web.RequestHandler):
@@ -87,7 +94,7 @@ class BaseHandler(web.RequestHandler):
             raise ValueError('Invalid Authorization token')
         return sid
 
-    def opencga_login(self, username=None, password=None, auth_token=None):
+    def _opencga_login(self, username=None, password=None, auth_token=None):
         try:
             if username and password:
                 self.oc = OpenCGAClient(configuration=self.config,
@@ -108,11 +115,18 @@ class BaseHandler(web.RequestHandler):
             raise web.HTTPError(reason='InvalidAuthentication::' + msg,
                                 status_code=401)
 
-    def get_file_info(self, study, sample, bioformat, name, **kwargs):
-        file_info = self.oc.files.search(
-            study=study, samples=sample, bioformat=bioformat, name=name,
-            include='id,uri,size', **kwargs
-        ).get()
+    def _get_file_info(self, study, file_id=None, sample=None, bioformat=None,
+                       name=None, **kwargs):
+        if file_id:
+            file_info = self.oc.files.search(
+                study=study, id=file_id, include='id,uri', **kwargs
+            ).get()
+        else:
+            file_info = self.oc.files.search(
+                study=study, samples=sample, bioformat=bioformat,
+                name=name, include='id,uri', **kwargs
+            ).get()
+
         if not file_info:
             msg = 'NotFound::No file found for sample "{}" in study "{}"'
             raise web.HTTPError(reason=msg.format(sample, study),
@@ -124,7 +138,7 @@ class BaseHandler(web.RequestHandler):
         else:
             return file_info[0]
 
-    def download_file(self, file_id, study, auth_token, prefix='htsget',
+    def _download_file(self, file_id, study, auth_token, prefix='htsget',
                       suffix='', _dir='/tmp', mode='wb', delete=True):
         r = requests.get(
             '{h}/webservices/rest/{v}/utils/ranges/{f}?study={s}&sid={sid}'.format(
@@ -138,30 +152,37 @@ class BaseHandler(web.RequestHandler):
         ntf.close()
         return ntf.name
 
-    def check_arguments(self):
-        format = self.request.arguments.get('format', None)
-        ref = self.request.arguments.get('referenceName', None)
-        start = self.request.arguments.get('start', None)
-        end = self.request.arguments.get('end', None)
+    def _get_args(self):
+        args = {arg: self.request.arguments[arg][0]
+                for arg in self.request.arguments}
 
+        ftype = args.get('format', None)
+        ref = args.get('referenceName', None)
+        start = args.get('start', None)
+        end = args.get('end', None)
+
+        # UnsupportedFormat error if the requested format is not supported
         class_name = self.__class__.__name__
-        if format and class_name == 'ReadsHandler' and format[0] not in ['BAM']:
-            msg = 'InvalidInput::Requested format is not supported'
-            raise web.HTTPError(reason=msg, status_code=400)
-        if format and class_name == 'VariantsHandler' and format[0] not in ['VCF']:
-            msg = 'InvalidInput::Requested format is not supported'
-            raise web.HTTPError(reason=msg, status_code=400)
+        if not ftype:
+            args['format'] = 'BAM' if class_name == 'ReadsHandler' else 'VCF'
+        else:
+            if (class_name == 'ReadsHandler' and ftype not in ['BAM']) or \
+                    (class_name == 'VariantsHandler' and ftype not in ['VCF']):
+                msg = 'UnsupportedFormat::Requested format is not supported'
+                raise web.HTTPError(reason=msg, status_code=400)
+
+        # InvalidInput error if start but no reference or referenceName is "*"
         if (start or end) and (ref == '*' or not ref):
             msg = ('InvalidInput::Coordinates are specified and either no'
                    ' reference is specified or referenceName is "*"')
             raise web.HTTPError(reason=msg, status_code=400)
-        if start and end and int(start[0]) > int(end[0]):
+
+        # InvalidRange error if start is greater than end
+        if start and end and int(start) > int(end):
             msg = 'InvalidRange::Start greater than end'
             raise web.HTTPError(reason=msg, status_code=400)
-        if (start and not end) or (end and not start):
-            msg = ('InvalidInput::Both start and end coordinates must be'
-                   ' supplied')
-            raise web.HTTPError(reason=msg, status_code=400)
+
+        return args
 
 
 class LoginHandler(BaseHandler):
@@ -179,8 +200,8 @@ class LoginHandler(BaseHandler):
             raise web.HTTPError(reason='InvalidInput::No password provided',
                                 status_code=400)
         else:
-            self.opencga_login(username=username, password=password)
-            self.write({"sessionId": self.oc.session_id})
+            self._opencga_login(username=username, password=password)
+            self.write({'sessionId': self.oc.session_id})
 
 
 class RefreshTokenHandler(BaseHandler):
@@ -198,8 +219,8 @@ class RefreshTokenHandler(BaseHandler):
             raise web.HTTPError(reason='InvalidInput::No token provided',
                                 status_code=400)
         else:
-            self.opencga_login(username=username, auth_token=token)
-            self.write({"sessionId": self.oc.session_id})
+            self._opencga_login(username=username, auth_token=token)
+            self.write({'sessionId': self.oc.session_id})
 
 
 class ReadsHandler(BaseHandler):
@@ -208,106 +229,92 @@ class ReadsHandler(BaseHandler):
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
 
-    @staticmethod
-    def _get_header_length(bai_fpath):
-        index = Index.from_file(filename=bai_fpath)
-        return index.header_length()
-
-    def _get_refs(self, study, bam_id):
-        return [
+    def _check_ref(self, study, bam_id, reference):
+        references = [
             ref['sequenceName']
             for ref in self.oc.files.search(
                 study=study, id=bam_id
             ).get()[0]['attributes']['alignmentHeader']['sequenceDiccionary']
         ]
-
-    @staticmethod
-    def _get_bytes(bai_fpath, bam_size, bam_header_length, refs, ref, start,
-                   end):
-        index = Index.from_file(filename=bai_fpath)
-
-        if ref:
-            try:
-                reference = refs.index(ref)
-            except Exception:
-                raise web.HTTPError(
-                    reason='NotFound::Requested reference does not exist',
-                    status_code=404
-                )
-
-            byte_range_list = [
-                (i[0], i[0] + i[1])
-                for i in index.region_offset_iter(ref=reference, beg=start,
-                                                  end=end)
-            ]
-        else:
-            # Return all the file when no reference is specified
-            # TODO Do it by chunks or all at once?
-            byte_range_list = [(bam_header_length + 1, bam_size-1)]
-        return byte_range_list
-
-    def _get_coordinates(self):
-        ref = self.request.arguments.get('referenceName', None)
-        start = self.request.arguments.get('start', None)
-        end = self.request.arguments.get('end', None)
-        return (str(ref[0]) if ref else None,
-                int(start[0]) if start else None,
-                int(end[0]) if end else None)
+        if reference not in references:
+            raise web.HTTPError(
+                reason='NotFound::Requested reference does not exist',
+                status_code=404
+            )
 
     def get(self, study, sample):
-        self.check_arguments()
+        # Login into OpenCGA
+        self._opencga_login(username='bertha', auth_token=self.auth_token)
 
-        self.opencga_login(username=self.username, auth_token=self.auth_token)
+        # Getting arguments
+        args = self._get_args()
 
-        response = {"htsget": {"format": "BAM", "urls": []}}
-
-        # Getting BAM ID, BAM size and BAI ID
-        bam_info = self.get_file_info(
+        # Getting BAM ID
+        bam_id = self._get_file_info(
             study=study, sample=sample, bioformat='ALIGNMENT', name='~.bam$',
-            **{'attributes.gelStatus': 'READY'}
-        )
-        bam_id = bam_info['id']
-        bam_size = bam_info['size']
-        bai_id = self.get_file_info(
-            study=study, sample=sample, bioformat='ALIGNMENT', name='~.bai$',
             **{'attributes.gelStatus': 'READY'}
         )['id']
 
-        # BAM chunks byte range
-        refs = self._get_refs(study, bam_id)
-        ref, start, end = self._get_coordinates()
-        bai_fpath = self.download_file(
-            bai_id, study, self.auth_token, prefix='htsget-{}'.format(sample),
-            suffix='.bai', delete=False
-        )
-        bam_header_length = self._get_header_length(bai_fpath) + 65536
-        byte_range_list = self._get_bytes(
-            bai_fpath, bam_size, bam_header_length, refs, ref, start, end
-        )
-        os.unlink(bai_fpath)
+        # Getting coordinates
+        ref, start, end = _get_coordinates(args)
+        self._check_ref(study, bam_id, ref)
 
-        # OpenCGA URL
-        opencga_url = '{host}/webservices/rest/{version}/utils/ranges/{file_id}?study={study_id}'
-        bam_body_url = opencga_url.format(host=self.config['rest']['hosts'][0],
-                                          version=self.config['version'],
-                                          file_id=bam_id,
-                                          study_id=study)
+        # Creating the response URL to retrieve data
+        url = '{host}/data?format={format}&study={study_id}&fileId={file_id}'
+        url += '&referenceName={reference_name}' if ref else ''
+        url += '&start={start}' if start else ''
+        url += '&end={end}' if end else ''
+        url = url.format(host='http://' + self.request.host,
+                         format=args['format'],
+                         study_id=study,
+                         file_id=bam_id,
+                         reference_name=ref,
+                         start=start,
+                         end=end)
 
         # Generating URLs
-        bam_chunks = [
-            {
-                "url": bam_body_url,
-                "headers": {
-                    "Authorization": self.auth_token,
-                    "Range": 'bytes={}-{}'.format(byte_range[0], byte_range[1])
-                }
-            } for byte_range in [(0, bam_header_length)] + byte_range_list
-            # } for byte_range in [(0, bam_header_length+19558)] + byte_range_list
-        ] + [
-            {'url': 'data:application/vnd.ga4gh.bam;base64,H4sIBAAAAAAA/wYAQkMCABsAAwAAAAAAAAAAAA=='}  # EOF
-        ]
+        response = {'htsget': {'format': 'BAM', 'urls': []}}
+        bam_chunks = [{'url': url,
+                       'headers': {'Authorization': self.auth_token,
+                                   'username': self.username}
+                       }]
         response['htsget']['urls'] = response['htsget']['urls'] + bam_chunks
 
+        self.write(response)
+
+
+class DataHandler(BaseHandler):
+    def __init__(self, application, request, **kwargs):
+        super(DataHandler, self).__init__(application, request, **kwargs)
+        self.auth_token = self.request.headers.get('Authorization', '')
+        self.username = self.request.headers.get('username', '')
+
+    def get(self):
+        # Login into OpenCGA
+        self._opencga_login(username='bertha', auth_token=self.auth_token)
+
+        # Getting arguments
+        args = self._get_args()
+
+        # Getting BAM ID
+        file_uri = self._get_file_info(
+            study=args['study'], file_id=args['fileId']
+        )['uri'].replace('file://', '')
+
+        ref, start, end = _get_coordinates(args)
+        print ref, start, end
+
+        # TODO REMOVE DEBUG LINES:
+        print file_uri
+        file_uri = '/home/dgil/dev/gel-htsget/htsget_server/LP3001241-DNA_D06.mini.bam'
+
+        samfile = AlignmentFile(file_uri, 'rb')
+        response = {'result': '\n'.join(
+            [str(samfile.header).rstrip('\n')] +
+            [read.to_string() for read in samfile.fetch(reference=ref,
+                                                        start=start,
+                                                        end=end)]
+        )}
         self.write(response)
 
 
@@ -317,9 +324,10 @@ class Htsget:
         config = ConfigHandler(config).get_configuration()
 
         self.application = web.Application([
-            (r"/user/login", LoginHandler, dict(config=config)),
-            (r"/user/refresh-token", RefreshTokenHandler, dict(config=config)),
-            (r"/reads/(.*)/(.*)", ReadsHandler, dict(config=config))
+            (r'/user/login', LoginHandler, dict(config=config)),
+            (r'/user/refresh-token', RefreshTokenHandler, dict(config=config)),
+            (r'/reads/(.*)/(.*)', ReadsHandler, dict(config=config)),
+            (r'/data', DataHandler, dict(config=config))
         ])
         self.application.listen(8888)
 
@@ -337,5 +345,5 @@ def main():
     htsget.start()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

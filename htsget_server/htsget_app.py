@@ -5,7 +5,10 @@ import yaml
 from tempfile import NamedTemporaryFile
 from tornado import ioloop, web
 from pyCGA.opencgarestclients import OpenCGAClient
-from pysam import AlignmentFile
+from pysam import AlignmentFile, VariantFile
+
+_READS_FORMAT = ['BAM']
+_VARIANTS_FORMAT = ['VCF']
 
 
 def _get_coordinates(args):
@@ -14,6 +17,31 @@ def _get_coordinates(args):
     start = int(args['start']) + 1 if 'start' in args else None
     end = int(args['end']) if 'end' in args else None
     return ref, start, end
+
+
+def _create_response(ref, start, end, study, host, format_, file_id, token,
+                        username):
+    # Creating the response URL to retrieve data
+    url = '{host}/data?format={format}&study={study_id}&fileId={file_id}'
+    url += '&referenceName={reference_name}' if ref else ''
+    url += '&start={start}' if start else ''
+    url += '&end={end}' if end else ''
+    url = url.format(host='http://' + host,
+                     format=format_,
+                     study_id=study,
+                     file_id=file_id,
+                     reference_name=ref,
+                     start=start,
+                     end=end)
+
+    response = {'htsget': {'format': format_, 'urls': []}}
+    chunks = [{'url': url,
+                   'headers': {'Authorization': token,
+                               'username': username}
+                   }]
+    response['htsget']['urls'] += chunks
+
+    return response
 
 
 class ConfigHandler:
@@ -94,6 +122,11 @@ class BaseHandler(web.RequestHandler):
         return sid
 
     def _opencga_login(self, username=None, password=None, auth_token=None):
+        if not (username and (password or auth_token)):
+            msg = 'Username/password or username/token not provided'
+            raise web.HTTPError(reason='InvalidAuthentication::' + msg,
+                                status_code=401)
+
         try:
             if username and password:
                 self.oc = OpenCGAClient(configuration=self.config,
@@ -152,8 +185,8 @@ class BaseHandler(web.RequestHandler):
         if not ftype:
             args['format'] = 'BAM' if class_name == 'ReadsHandler' else 'VCF'
         else:
-            if (class_name == 'ReadsHandler' and ftype not in ['BAM']) or \
-                    (class_name == 'VariantsHandler' and ftype not in ['VCF']):
+            if (class_name == 'ReadsHandler' and ftype not in _READS_FORMAT) or \
+                    (class_name == 'VariantsHandler' and ftype not in _VARIANTS_FORMAT):
                 msg = 'UnsupportedFormat::Requested format is not supported'
                 raise web.HTTPError(reason=msg, status_code=400)
 
@@ -230,7 +263,7 @@ class ReadsHandler(BaseHandler):
 
     def get(self, study, sample):
         # Login into OpenCGA
-        self._opencga_login(username='bertha', auth_token=self.auth_token)
+        self._opencga_login(username=self.username, auth_token=self.auth_token)
 
         # Getting arguments
         args = self._get_args()
@@ -246,70 +279,114 @@ class ReadsHandler(BaseHandler):
         self._check_ref(study, bam_id, ref)
 
         # Creating the response URL to retrieve data
-        url = '{host}/data?format={format}&study={study_id}&fileId={file_id}'
-        url += '&referenceName={reference_name}' if ref else ''
-        url += '&start={start}' if start else ''
-        url += '&end={end}' if end else ''
-        url = url.format(host='http://' + self.request.host,
-                         format=args['format'],
-                         study_id=study,
-                         file_id=bam_id,
-                         reference_name=ref,
-                         start=start,
-                         end=end)
+        response = _create_response(
+            ref, start, end, study, self.request.host, args['format'], bam_id,
+            self.auth_token, self.username
+        )
+        self.write(response)
 
-        # Generating URLs
-        response = {'htsget': {'format': 'BAM', 'urls': []}}
-        bam_chunks = [{'url': url,
-                       'headers': {'Authorization': self.auth_token,
-                                   'username': self.username}
-                       }]
-        response['htsget']['urls'] += bam_chunks
 
+class VariantsHandler(BaseHandler):
+    def __init__(self, application, request, **kwargs):
+        super(VariantsHandler, self).__init__(application, request, **kwargs)
+        self.auth_token = self.request.headers.get('Authorization', '')
+        self.username = self.request.headers.get('username', '')
+
+    def _check_ref(self, study, vcf_id, reference):
+        references = [
+            i['id'] for i in self.oc.files.search(
+                study=study, id=vcf_id
+            ).get()[0]['attributes']['variantFileMetadata']['header']['complexLines']
+            if i['key'] == 'contig'
+        ]
+        if reference not in references:
+            raise web.HTTPError(
+                reason='NotFound::Requested reference does not exist',
+                status_code=404
+            )
+
+    def get(self, study, vcf_type, sample):
+        # Login into OpenCGA
+        self._opencga_login(username=self.username, auth_token=self.auth_token)
+
+        # Getting arguments
+        args = self._get_args()
+
+        # Getting VCF ID
+        # TODO define all vcf types
+        if vcf_type == 'SMALL_VARIANT':
+            name = sample + '.duprem.left.split.reheadered.vcf.gz'
+        elif vcf_type in ['SV', 'CNV']:
+            name = sample + '.SV.reheadered.vcf.gz'
+        else:
+            msg = ('InvalidInput::VCF type should be one of the following:'
+                   ' ["SMALL_VARIANT", "SV", "CNV"]')
+            raise web.HTTPError(reason=msg, status_code=400)
+        vcf_id = self._get_file_info(
+            study=study, sample=sample, bioformat='VARIANT', name=name,
+            **{'attributes.gelStatus': 'READY'}
+        )['id']
+
+        # Getting coordinates
+        ref, start, end = _get_coordinates(args)
+        self._check_ref(study, vcf_id, ref)
+
+        # Creating the response URL to retrieve data
+        response = _create_response(
+            ref, start, end, study, self.request.host, args['format'], vcf_id,
+            self.auth_token, self.username
+        )
         self.write(response)
 
 
 class DataHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(DataHandler, self).__init__(application, request, **kwargs)
-        # TODO handle error if auth_token or username not present in header
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
-        # TODO REMOVE DEBUG LINES:
-        # self.auth_token = 'Bearer ' + self.request.arguments.get('sid', '')[0]
-        # self.username = self.request.arguments.get('user', '')
         self.ntf = NamedTemporaryFile(prefix='htsget', suffix='', dir='/tmp',
                                       mode='wb', delete=False)
-        self.set_header('Content-Type', 'application/vnd.ga4gh.bam')
+        self._buf_size = 1000
 
     def get(self):
         # Login into OpenCGA
-        self._opencga_login(username='bertha', auth_token=self.auth_token)
+        self._opencga_login(username=self.username, auth_token=self.auth_token)
 
         # Getting arguments
         args = self._get_args()
 
-        # Getting BAM ID and BAM name
+        # Getting file uri
         file_uri = self._get_file_info(
             study=args['study'], file_id=args['fileId']
         )['uri'].replace('file://', '')
 
         ref, start, end = _get_coordinates(args)
 
-        # TODO REMOVE DEBUG LINES:
-        # print file_uri
-        # file_uri = '/home/dgil/dev/gel-htsget/htsget_server/LP3001241-DNA_D06.mini.bam'
+        # Getting file data
+        if args['format'] in _READS_FORMAT:
+            self.set_header('Content-Type', 'application/vnd.ga4gh.bam')
+            samfile = AlignmentFile(file_uri, 'rb')
+            bamfile = AlignmentFile(self.ntf, header=samfile.header, mode='wb')
+            for read in samfile.fetch(ref, start, end):
+                bamfile.write(read)
+            samfile.close()
+            bamfile.close()
+        elif args['format'] in _VARIANTS_FORMAT:
+            self.set_header('Content-Type', 'application/vnd.ga4gh.vcf')
+            vcffile_in = VariantFile(file_uri, 'r')
+            vcffile_out = VariantFile(self.ntf, header=vcffile_in.header, mode='w')
+            for read in vcffile_in.fetch(ref, start, end):
+                vcffile_out.write(read)
+            vcffile_in.close()
+            vcffile_out.close()
 
-        # TODO Data blocks should not exceed ~1GB
-        samfile = AlignmentFile(file_uri, 'rb')
-        bamfile = AlignmentFile(self.ntf, template=samfile, mode='wb')
-        for read in samfile.fetch(ref, start, end):
-            bamfile.write(read)
-        samfile.close()
-        bamfile.close()
-
+        # Data blocks should not exceed ~1GB
         with open(self.ntf.name, 'rb') as f:
-            self.write(f.read())
+            while True:
+                data = f.read(self._buf_size)
+                if not data:
+                    break
+                self.write(data)
 
         os.remove(self.ntf.name)
 
@@ -323,6 +400,7 @@ class Htsget:
             (r'/user/login', LoginHandler, dict(config=config)),
             (r'/user/refresh-token', RefreshTokenHandler, dict(config=config)),
             (r'/reads/(.*)/(.*)', ReadsHandler, dict(config=config)),
+            (r'/variants/(.*)/(.*)/(.*)', VariantsHandler, dict(config=config)),
             # TODO this should be https
             (r'/data', DataHandler, dict(config=config))
         ])

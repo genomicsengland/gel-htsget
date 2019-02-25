@@ -1,9 +1,8 @@
+import os
 import sys
 import json
 import yaml
-import requests
 from tempfile import NamedTemporaryFile
-
 from tornado import ioloop, web
 from pyCGA.opencgarestclients import OpenCGAClient
 from pysam import AlignmentFile
@@ -117,14 +116,15 @@ class BaseHandler(web.RequestHandler):
 
     def _get_file_info(self, study, file_id=None, sample=None, bioformat=None,
                        name=None, **kwargs):
+        include = 'id,uri'
         if file_id:
             file_info = self.oc.files.search(
-                study=study, id=file_id, include='id,uri', **kwargs
+                study=study, id=file_id, include=include, **kwargs
             ).get()
         else:
             file_info = self.oc.files.search(
                 study=study, samples=sample, bioformat=bioformat,
-                name=name, include='id,uri', **kwargs
+                name=name, include=include, **kwargs
             ).get()
 
         if not file_info:
@@ -137,20 +137,6 @@ class BaseHandler(web.RequestHandler):
                                 status_code=404)
         else:
             return file_info[0]
-
-    def _download_file(self, file_id, study, auth_token, prefix='htsget',
-                      suffix='', _dir='/tmp', mode='wb', delete=True):
-        r = requests.get(
-            '{h}/webservices/rest/{v}/utils/ranges/{f}?study={s}&sid={sid}'.format(
-                h=self.config['rest']['hosts'][0], v=self.config['version'],
-                f=file_id, s=study, sid=self._get_session_id(auth_token)
-            )
-        )
-        ntf = NamedTemporaryFile(prefix=prefix, suffix=suffix, dir=_dir,
-                                 mode=mode, delete=delete)
-        ntf.write(r.content)
-        ntf.close()
-        return ntf.name
 
     def _get_args(self):
         args = {arg: self.request.arguments[arg][0]
@@ -278,7 +264,7 @@ class ReadsHandler(BaseHandler):
                        'headers': {'Authorization': self.auth_token,
                                    'username': self.username}
                        }]
-        response['htsget']['urls'] = response['htsget']['urls'] + bam_chunks
+        response['htsget']['urls'] += bam_chunks
 
         self.write(response)
 
@@ -286,8 +272,15 @@ class ReadsHandler(BaseHandler):
 class DataHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(DataHandler, self).__init__(application, request, **kwargs)
+        # TODO handle error if auth_token or username not present in header
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
+        # TODO REMOVE DEBUG LINES:
+        # self.auth_token = 'Bearer ' + self.request.arguments.get('sid', '')[0]
+        # self.username = self.request.arguments.get('user', '')
+        self.ntf = NamedTemporaryFile(prefix='htsget', suffix='', dir='/tmp',
+                                      mode='wb', delete=False)
+        self.set_header('Content-Type', 'application/vnd.ga4gh.bam')
 
     def get(self):
         # Login into OpenCGA
@@ -296,26 +289,29 @@ class DataHandler(BaseHandler):
         # Getting arguments
         args = self._get_args()
 
-        # Getting BAM ID
+        # Getting BAM ID and BAM name
         file_uri = self._get_file_info(
             study=args['study'], file_id=args['fileId']
         )['uri'].replace('file://', '')
 
         ref, start, end = _get_coordinates(args)
-        print ref, start, end
 
         # TODO REMOVE DEBUG LINES:
-        print file_uri
-        file_uri = '/home/dgil/dev/gel-htsget/htsget_server/LP3001241-DNA_D06.mini.bam'
+        # print file_uri
+        # file_uri = '/home/dgil/dev/gel-htsget/htsget_server/LP3001241-DNA_D06.mini.bam'
 
+        # TODO Data blocks should not exceed ~1GB
         samfile = AlignmentFile(file_uri, 'rb')
-        response = {'result': '\n'.join(
-            [str(samfile.header).rstrip('\n')] +
-            [read.to_string() for read in samfile.fetch(reference=ref,
-                                                        start=start,
-                                                        end=end)]
-        )}
-        self.write(response)
+        bamfile = AlignmentFile(self.ntf, template=samfile, mode='wb')
+        for read in samfile.fetch(ref, start, end):
+            bamfile.write(read)
+        samfile.close()
+        bamfile.close()
+
+        with open(self.ntf.name, 'rb') as f:
+            self.write(f.read())
+
+        os.remove(self.ntf.name)
 
 
 class Htsget:
@@ -327,6 +323,7 @@ class Htsget:
             (r'/user/login', LoginHandler, dict(config=config)),
             (r'/user/refresh-token', RefreshTokenHandler, dict(config=config)),
             (r'/reads/(.*)/(.*)', ReadsHandler, dict(config=config)),
+            # TODO this should be https
             (r'/data', DataHandler, dict(config=config))
         ])
         self.application.listen(8888)

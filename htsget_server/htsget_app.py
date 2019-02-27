@@ -344,6 +344,7 @@ class DataHandler(BaseHandler):
         super(DataHandler, self).__init__(application, request, **kwargs)
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
+
         self.ntf = NamedTemporaryFile(prefix='htsget', suffix='', dir='/tmp',
                                       mode='wb', delete=False)
         self._buf_size = 1000
@@ -366,7 +367,7 @@ class DataHandler(BaseHandler):
         if args['format'] in _READS_FORMAT:
             self.set_header('Content-Type', 'application/vnd.ga4gh.bam')
             samfile = AlignmentFile(file_uri, 'rb')
-            bamfile = AlignmentFile(self.ntf, header=samfile.header, mode='wb')
+            bamfile = AlignmentFile(self.ntf.name, header=samfile.header, mode='wb')
             for read in samfile.fetch(ref, start, end):
                 bamfile.write(read)
             samfile.close()
@@ -374,7 +375,7 @@ class DataHandler(BaseHandler):
         elif args['format'] in _VARIANTS_FORMAT:
             self.set_header('Content-Type', 'application/vnd.ga4gh.vcf')
             vcffile_in = VariantFile(file_uri, 'r')
-            vcffile_out = VariantFile(self.ntf, header=vcffile_in.header, mode='w')
+            vcffile_out = VariantFile(self.ntf.name, header=vcffile_in.header, mode='w')
             for read in vcffile_in.fetch(ref, start, end):
                 vcffile_out.write(read)
             vcffile_in.close()

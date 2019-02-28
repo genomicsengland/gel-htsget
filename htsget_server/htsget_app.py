@@ -347,7 +347,7 @@ class DataHandler(BaseHandler):
 
         self.ntf = NamedTemporaryFile(prefix='htsget', suffix='', dir='/tmp',
                                       mode='wb', delete=False)
-        self._buf_size = 1000
+        self._buf_size = 1000000000
 
     def get(self):
         # Login into OpenCGA
@@ -380,6 +380,7 @@ class DataHandler(BaseHandler):
                 vcffile_out.write(read)
             vcffile_in.close()
             vcffile_out.close()
+            # TODO this returns an uncompressed VCF -> should it be compresed?
 
         # Data blocks should not exceed ~1GB
         with open(self.ntf.name, 'rb') as f:

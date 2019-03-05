@@ -11,40 +11,7 @@ _READS_FORMAT = ['BAM']
 _VARIANTS_FORMAT = ['VCF']
 
 
-def _get_coordinates(args):
-    # Start: 0-based, inclusive. End: 0-based exclusive.
-    ref = str(args['referenceName']) if 'referenceName' in args else None
-    start = int(args['start']) + 1 if 'start' in args else None
-    end = int(args['end']) if 'end' in args else None
-    return ref, start, end
-
-
-def _create_response(ref, start, end, study, host, format_, file_id, token,
-                        username):
-    # Creating the response URL to retrieve data
-    url = '{host}/data?format={format}&study={study_id}&fileId={file_id}'
-    url += '&referenceName={reference_name}' if ref else ''
-    url += '&start={start}' if start else ''
-    url += '&end={end}' if end else ''
-    url = url.format(host='http://' + host,
-                     format=format_,
-                     study_id=study,
-                     file_id=file_id,
-                     reference_name=ref,
-                     start=start,
-                     end=end)
-
-    response = {'htsget': {'format': format_, 'urls': []}}
-    chunks = [{'url': url,
-                   'headers': {'Authorization': token,
-                               'username': username}
-                   }]
-    response['htsget']['urls'] += chunks
-
-    return response
-
-
-class ConfigHandler:
+class OpenCGAConfigHandler:
     def __init__(self, config_fpath):
         self.config_fpath = config_fpath
         self.host = None
@@ -66,6 +33,8 @@ class ConfigHandler:
             msg = 'File path must end in "yml", "yaml" or "json"'
             raise IOError(msg)
 
+        config_fhand.close()
+
         host = config_dict['rest']['hosts'][0]
         if not (host.startswith('http://') or host.startswith('https://')):
             self.host = 'http://' + host
@@ -75,11 +44,34 @@ class ConfigHandler:
         return {'version': self.version, 'rest': {'hosts': [self.host]}}
 
 
+class VCFTypeConfig:
+    def __init__(self, config_fpath):
+        self.config_fpath = config_fpath
+        self.vcf_types = {}
+        self._get_vcf_types()
+
+    def _get_vcf_types(self):
+        try:
+            config_fhand = open(self.config_fpath, 'r')
+        except Exception:
+            msg = 'Unable to read config file "' + self.config_fpath + '"'
+            raise IOError(msg)
+
+        for line in config_fhand:
+            study, type_, regex = line.rstrip('\n').split()
+            self.vcf_types.setdefault(study, {}).update({type_: regex})
+
+        config_fhand.close()
+
+    def get_vcf_types(self):
+        return self.vcf_types
+
+
 class BaseHandler(web.RequestHandler):
     def __init__(self, application, request, **kwargs):
         super(BaseHandler, self).__init__(application, request)
         self.oc = None
-        self.config = kwargs['config']
+        self.opencga_config = kwargs['opencga_config']
 
     def options(self):
         method = self.request.headers.get('Access-Control-Request-Method', '')
@@ -129,13 +121,13 @@ class BaseHandler(web.RequestHandler):
 
         try:
             if username and password:
-                self.oc = OpenCGAClient(configuration=self.config,
+                self.oc = OpenCGAClient(configuration=self.opencga_config,
                                         user=username,
                                         pwd=password,
                                         auto_refresh=False)
             elif username and auth_token:
                 session_id = self._get_session_id(auth_token)
-                self.oc = OpenCGAClient(configuration=self.config,
+                self.oc = OpenCGAClient(configuration=self.opencga_config,
                                         user=username,
                                         session_id=session_id,
                                         auto_refresh=False)
@@ -147,18 +139,25 @@ class BaseHandler(web.RequestHandler):
             raise web.HTTPError(reason='InvalidAuthentication::' + msg,
                                 status_code=401)
 
-    def _get_file_info(self, study, file_id=None, sample=None, bioformat=None,
-                       name=None, **kwargs):
+    def _get_file_info(self, study, file_id=None, sample=None, path=None,
+                       bioformat=None, name=None, **kwargs):
         include = 'id,uri'
-        if file_id:
+        if file_id and not (name or path):
             file_info = self.oc.files.search(
                 study=study, id=file_id, include=include, **kwargs
             ).get()
-        else:
+        elif sample and name and not (file_id or path):
             file_info = self.oc.files.search(
                 study=study, samples=sample, bioformat=bioformat,
                 name=name, include=include, **kwargs
             ).get()
+        elif path and not (file_id or sample):
+            file_info = self.oc.files.search(
+                study=study, bioformat=bioformat, path=path, include=include,
+                **kwargs
+            ).get()
+        else:
+            file_info = None
 
         if not file_info:
             msg = 'NotFound::No file found for sample "{}" in study "{}"'
@@ -171,7 +170,10 @@ class BaseHandler(web.RequestHandler):
         else:
             return file_info[0]
 
-    def _get_args(self):
+    def _get_args(self, endpoint):
+
+        assert endpoint in ['reads', 'variants', 'data']
+
         args = {arg: self.request.arguments[arg][0]
                 for arg in self.request.arguments}
 
@@ -181,12 +183,11 @@ class BaseHandler(web.RequestHandler):
         end = args.get('end', None)
 
         # UnsupportedFormat error if the requested format is not supported
-        class_name = self.__class__.__name__
         if not ftype:
-            args['format'] = 'BAM' if class_name == 'ReadsHandler' else 'VCF'
+            args['format'] = 'BAM' if endpoint == 'reads' else 'VCF'
         else:
-            if (class_name == 'ReadsHandler' and ftype not in _READS_FORMAT) or \
-                    (class_name == 'VariantsHandler' and ftype not in _VARIANTS_FORMAT):
+            if (endpoint == 'reads' and ftype not in _READS_FORMAT) or \
+                    (endpoint == 'variants' and ftype not in _VARIANTS_FORMAT):
                 msg = 'UnsupportedFormat::Requested format is not supported'
                 raise web.HTTPError(reason=msg, status_code=400)
 
@@ -202,6 +203,67 @@ class BaseHandler(web.RequestHandler):
             raise web.HTTPError(reason=msg, status_code=400)
 
         return args
+
+    def _check_ref(self, endpoint, study, file_id, reference):
+
+        assert endpoint in ['reads', 'variants', 'data']
+
+        if endpoint == 'reads':
+            references = [
+                ref['sequenceName']
+                for ref in self.oc.files.search(
+                    study=study, id=file_id
+                ).get()[0]['attributes']['alignmentHeader']['sequenceDiccionary']
+            ]
+        elif endpoint == 'variants':
+            references = [
+                i['id'] for i in self.oc.files.search(
+                    study=study, id=file_id
+                ).get()[0]['attributes']['variantFileMetadata']['header'][
+                    'complexLines']
+                if i['key'] == 'contig'
+            ]
+        else:
+            references = []
+
+        if reference not in references:
+            raise web.HTTPError(
+                reason='NotFound::Requested reference does not exist',
+                status_code=404
+            )
+
+    @staticmethod
+    def _get_coordinates(args):
+        # Start: 0-based, inclusive. End: 0-based exclusive.
+        ref = str(args['referenceName']) if 'referenceName' in args else None
+        start = int(args['start']) + 1 if 'start' in args else None
+        end = int(args['end']) if 'end' in args else None
+        return ref, start, end
+
+    @staticmethod
+    def _create_response(ref, start, end, study, host, format_, file_id, token,
+                         username):
+        # Creating the response URL to retrieve data
+        url = '{host}/data?format={format}&study={study_id}&fileId={file_id}'
+        url += '&referenceName={reference_name}' if ref else ''
+        url += '&start={start}' if start else ''
+        url += '&end={end}' if end else ''
+        url = url.format(host='http://' + host,
+                         format=format_,
+                         study_id=study,
+                         file_id=file_id,
+                         reference_name=ref,
+                         start=start,
+                         end=end)
+
+        response = {'htsget': {'format': format_, 'urls': []}}
+        chunks = [{'url': url,
+                       'headers': {'Authorization': token,
+                                   'username': username}
+                       }]
+        response['htsget']['urls'] += chunks
+
+        return response
 
 
 class LoginHandler(BaseHandler):
@@ -245,28 +307,16 @@ class RefreshTokenHandler(BaseHandler):
 class ReadsHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(ReadsHandler, self).__init__(application, request, **kwargs)
+        self.endpoint = 'reads'
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
-
-    def _check_ref(self, study, bam_id, reference):
-        references = [
-            ref['sequenceName']
-            for ref in self.oc.files.search(
-                study=study, id=bam_id
-            ).get()[0]['attributes']['alignmentHeader']['sequenceDiccionary']
-        ]
-        if reference not in references:
-            raise web.HTTPError(
-                reason='NotFound::Requested reference does not exist',
-                status_code=404
-            )
 
     def get(self, study, sample):
         # Login into OpenCGA
         self._opencga_login(username=self.username, auth_token=self.auth_token)
 
         # Getting arguments
-        args = self._get_args()
+        args = self._get_args(self.endpoint)
 
         # Getting BAM ID
         bam_id = self._get_file_info(
@@ -275,11 +325,43 @@ class ReadsHandler(BaseHandler):
         )['id']
 
         # Getting coordinates
-        ref, start, end = _get_coordinates(args)
-        self._check_ref(study, bam_id, ref)
+        ref, start, end = self._get_coordinates(args)
+        self._check_ref(self.endpoint, study, bam_id, ref)
 
         # Creating the response URL to retrieve data
-        response = _create_response(
+        response = self._create_response(
+            ref, start, end, study, self.request.host, args['format'], bam_id,
+            self.auth_token, self.username
+        )
+        self.write(response)
+
+
+class ReadsByPathHandler(BaseHandler):
+    def __init__(self, application, request, **kwargs):
+        super(ReadsByPathHandler, self).__init__(application, request, **kwargs)
+        self.endpoint = 'reads'
+        self.auth_token = self.request.headers.get('Authorization', '')
+        self.username = self.request.headers.get('username', '')
+
+    def get(self, study, path):
+        # Login into OpenCGA
+        self._opencga_login(username=self.username, auth_token=self.auth_token)
+
+        # Getting arguments
+        args = self._get_args(self.endpoint)
+
+        # Getting BAM ID
+        bam_id = self._get_file_info(
+            study=study, path=path.replace(':', '/'), bioformat='ALIGNMENT',
+            **{'attributes.gelStatus': 'READY'}
+        )['id']
+
+        # Getting coordinates
+        ref, start, end = self._get_coordinates(args)
+        self._check_ref(self.endpoint, study, bam_id, ref)
+
+        # Creating the response URL to retrieve data
+        response = self._create_response(
             ref, start, end, study, self.request.host, args['format'], bam_id,
             self.auth_token, self.username
         )
@@ -289,50 +371,76 @@ class ReadsHandler(BaseHandler):
 class VariantsHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(VariantsHandler, self).__init__(application, request, **kwargs)
+        self.endpoint = 'variants'
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
-
-    def _check_ref(self, study, vcf_id, reference):
-        references = [
-            i['id'] for i in self.oc.files.search(
-                study=study, id=vcf_id
-            ).get()[0]['attributes']['variantFileMetadata']['header']['complexLines']
-            if i['key'] == 'contig'
-        ]
-        if reference not in references:
-            raise web.HTTPError(
-                reason='NotFound::Requested reference does not exist',
-                status_code=404
-            )
+        self.extra_options = kwargs
 
     def get(self, study, vcf_type, sample):
         # Login into OpenCGA
         self._opencga_login(username=self.username, auth_token=self.auth_token)
 
         # Getting arguments
-        args = self._get_args()
+        args = self._get_args(self.endpoint)
 
         # Getting VCF ID
-        # TODO define all vcf types
-        if vcf_type == 'SMALL_VARIANT':
-            name = sample + '.duprem.left.split.reheadered.vcf.gz'
-        elif vcf_type in ['SV', 'CNV']:
-            name = sample + '.SV.reheadered.vcf.gz'
-        else:
-            msg = ('InvalidInput::VCF type should be one of the following:'
-                   ' ["SMALL_VARIANT", "SV", "CNV"]')
+        if 'vcf_types' not in self.extra_options:
+            msg = 'InvalidInput::Configuration file with VCF types required'
             raise web.HTTPError(reason=msg, status_code=400)
+
+        if study not in self.extra_options['vcf_types']:
+            msg = 'InvalidInput::Study not defined in the VCF types configuration file'
+            raise web.HTTPError(reason=msg, status_code=400)
+
+        if vcf_type not in self.extra_options['vcf_types'][study]:
+            msg = 'InvalidInput::VCF type not defined for the study "{}" in the VCF types configuration file'
+            raise web.HTTPError(reason=msg.format(study), status_code=400)
+
+        regex = self.extra_options['vcf_types'][study][vcf_type]
         vcf_id = self._get_file_info(
-            study=study, sample=sample, bioformat='VARIANT', name=name,
+            study=study, sample=sample, bioformat='VARIANT', name=regex,
             **{'attributes.gelStatus': 'READY'}
         )['id']
 
         # Getting coordinates
-        ref, start, end = _get_coordinates(args)
-        self._check_ref(study, vcf_id, ref)
+        ref, start, end = self._get_coordinates(args)
+        self._check_ref(self.endpoint, study, vcf_id, ref)
 
         # Creating the response URL to retrieve data
-        response = _create_response(
+        response = self._create_response(
+            ref, start, end, study, self.request.host, args['format'], vcf_id,
+            self.auth_token, self.username
+        )
+        self.write(response)
+
+
+class VariantsByPathHandler(BaseHandler):
+    def __init__(self, application, request, **kwargs):
+        super(VariantsByPathHandler, self).__init__(application, request,
+                                                    **kwargs)
+        self.endpoint = 'variants'
+        self.auth_token = self.request.headers.get('Authorization', '')
+        self.username = self.request.headers.get('username', '')
+
+    def get(self, study, path):
+        # Login into OpenCGA
+        self._opencga_login(username=self.username, auth_token=self.auth_token)
+
+        # Getting arguments
+        args = self._get_args(self.endpoint)
+
+        # Getting VCF ID
+        vcf_id = self._get_file_info(
+            study=study, path=path.replace(':', '/'), bioformat='VARIANT',
+            **{'attributes.gelStatus': 'READY'}
+        )['id']
+
+        # Getting coordinates
+        ref, start, end = self._get_coordinates(args)
+        self._check_ref(self.endpoint, study, vcf_id, ref)
+
+        # Creating the response URL to retrieve data
+        response = self._create_response(
             ref, start, end, study, self.request.host, args['format'], vcf_id,
             self.auth_token, self.username
         )
@@ -342,6 +450,7 @@ class VariantsHandler(BaseHandler):
 class DataHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
         super(DataHandler, self).__init__(application, request, **kwargs)
+        self.endpoint = 'data'
         self.auth_token = self.request.headers.get('Authorization', '')
         self.username = self.request.headers.get('username', '')
 
@@ -354,14 +463,14 @@ class DataHandler(BaseHandler):
         self._opencga_login(username=self.username, auth_token=self.auth_token)
 
         # Getting arguments
-        args = self._get_args()
+        args = self._get_args(self.endpoint)
 
         # Getting file uri
         file_uri = self._get_file_info(
             study=args['study'], file_id=args['fileId']
         )['uri'].replace('file://', '')
 
-        ref, start, end = _get_coordinates(args)
+        ref, start, end = self._get_coordinates(args)
 
         # Getting file data
         if args['format'] in _READS_FORMAT:
@@ -380,7 +489,6 @@ class DataHandler(BaseHandler):
                 vcffile_out.write(read)
             vcffile_in.close()
             vcffile_out.close()
-            # TODO this returns an uncompressed VCF -> should it be compresed?
 
         # Data blocks should not exceed ~1GB
         with open(self.ntf.name, 'rb') as f:
@@ -394,17 +502,31 @@ class DataHandler(BaseHandler):
 
 
 class Htsget:
-    def __init__(self, config):
+    def __init__(self, opencga_config, vcf_types_config=None):
 
-        config = ConfigHandler(config).get_configuration()
+        opencga_config = OpenCGAConfigHandler(opencga_config).get_configuration()
+
+        vcf_types = None
+        if vcf_types_config is not None:
+            vcf_types = VCFTypeConfig(vcf_types_config).get_vcf_types()
 
         self.application = web.Application([
-            (r'/user/login', LoginHandler, dict(config=config)),
-            (r'/user/refresh-token', RefreshTokenHandler, dict(config=config)),
-            (r'/reads/(.*)/(.*)', ReadsHandler, dict(config=config)),
-            (r'/variants/(.*)/(.*)/(.*)', VariantsHandler, dict(config=config)),
-            # TODO this should be https
-            (r'/data', DataHandler, dict(config=config))
+            (r'/user/login', LoginHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/user/refresh-token', RefreshTokenHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/reads/(?!bypath)(.*)/(.*)', ReadsHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/reads/bypath/(.*)/(.*)', ReadsByPathHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/variants/(?!bypath)(.*)/(.*)/(.*)', VariantsHandler,
+             dict(opencga_config=opencga_config, vcf_types=vcf_types) if vcf_types
+             else dict(opencga_config=opencga_config)),
+            (r'/variants/bypath/(.*)/(.*)', VariantsByPathHandler,
+             dict(opencga_config=opencga_config)),
+            # TODO data endpoint should be https
+            (r'/data', DataHandler,
+             dict(opencga_config=opencga_config))
         ])
         self.application.listen(8888)
 
@@ -418,7 +540,8 @@ class Htsget:
 
 
 def main():
-    htsget = Htsget(config='./opencga.json')
+    htsget = Htsget(opencga_config='./opencga.json',
+                    vcf_types_config='./vcf_types.tsv')
     htsget.start()
 
 

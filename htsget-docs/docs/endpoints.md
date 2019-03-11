@@ -9,6 +9,13 @@
 
 ---
 
+* **Token Refresh** - `POST /user/refresh-token`
+    - Given a LDAP username and a password (`{"username": "USER", "token": "TOKEN"}`), returns a session ID.
+    - This token is passed in the header of the GET requests to access the genomic data.
+    - Authentication and authorisation are managed by [OpenCGA](http://docs.opencb.org/display/opencga).
+
+---
+
 * **Reads** - `GET /reads/{study_id}/{sample_id}`
     - This endpoint allows access to read data (BAM)
 

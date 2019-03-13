@@ -1,0 +1,6 @@
+CS38	SV	~.SV.reheadered.vcf.gz$
+CS38	CNV	~.SV.reheadered.vcf.gz$
+CS38	SMALL_VARIANT	~.duprem.left.split.reheadered.vcf.gz$
+RD38	STR	~_S1_ExpansionHunter.vcf$
+RD38	SV	~.SV.vcf.gz$
+RD38	CNV	~.CNV.vcf.gz$

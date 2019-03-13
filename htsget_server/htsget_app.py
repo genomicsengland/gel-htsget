@@ -1,15 +1,21 @@
+import logging
 import os
 import sys
 import json
+
 import yaml
 from tempfile import NamedTemporaryFile
 from tornado import ioloop, web
 from pyCGA.opencgarestclients import OpenCGAClient
 from pysam import AlignmentFile, VariantFile
+from tornado.options import options, define
 
 _READS_FORMAT = ['BAM']
 _VARIANTS_FORMAT = ['VCF']
+_OPENCGA_CONF = os.getenv('OPENCGA_CONF', './opencga.json')
+_VCF_TYPES = os.getenv('VCF_TYPES', './vcf_types.tsv')
 
+define("port", default=8888, help="run on the given port", type=int)
 
 class OpenCGAConfigHandler:
     def __init__(self, config_fpath):
@@ -356,6 +362,8 @@ class ReadsByPathHandler(BaseHandler):
             **{'attributes.gelStatus': 'READY'}
         )['id']
 
+        logging.info('User {} asked for BAM Id: {}'.format(self.username, bam_id))
+
         # Getting coordinates
         ref, start, end = self._get_coordinates(args)
         self._check_ref(self.endpoint, study, bam_id, ref)
@@ -528,7 +536,7 @@ class Htsget:
             (r'/data', DataHandler,
              dict(opencga_config=opencga_config))
         ])
-        self.application.listen(8888)
+
 
     @staticmethod
     def start():
@@ -540,8 +548,9 @@ class Htsget:
 
 
 def main():
-    htsget = Htsget(opencga_config='./opencga.json',
-                    vcf_types_config='./vcf_types.tsv')
+    options.parse_command_line()
+    htsget = Htsget(opencga_config=_OPENCGA_CONF, vcf_types_config=_VCF_TYPES)
+    htsget.application.listen(options.port)
     htsget.start()
 
 

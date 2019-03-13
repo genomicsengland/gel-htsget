@@ -1,0 +1,8 @@
+{
+    "version": "v1",
+    "rest": {
+        "hosts": [
+           "bio-prod-opencgainternal-haproxy-01.gel.zone/opencga"
+        ]
+    }
+}

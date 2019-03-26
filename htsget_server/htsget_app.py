@@ -258,7 +258,9 @@ class BaseHandler(web.RequestHandler):
 
         response = {'htsget': {'format': format_, 'urls': []}}
         chunks = [{'url': url,
-                   'headers': {'Authorization': token, 'username': username}}]
+                       'headers': {'Authorization': token,
+                                   'username': username}
+                       }]
         response['htsget']['urls'] += chunks
 
         return response
@@ -499,16 +501,6 @@ class DataHandler(BaseHandler):
         os.remove(self.ntf.name)
 
 
-class PingHandler(web.RequestHandler):
-    def __init__(self, application, request, **kwargs):
-        super(PingHandler, self).__init__(application, request, **kwargs)
-        self.endpoint = 'ping'
-
-    def get(self):
-        response = {'htsget': {'response': 'pong'}}
-        self.write(response)
-
-
 class Htsget:
     def __init__(self, opencga_config, vcf_types_config=None):
 
@@ -534,8 +526,7 @@ class Htsget:
              dict(opencga_config=opencga_config)),
             # TODO data endpoint should be https
             (r'/data', DataHandler,
-             dict(opencga_config=opencga_config)),
-            (r'/meta/ping', PingHandler)
+             dict(opencga_config=opencga_config))
         ])
         self.application.listen(8888)
 
@@ -549,10 +540,8 @@ class Htsget:
 
 
 def main():
-    dirname = os.path.dirname(os.path.realpath(__file__))
-
-    htsget = Htsget(opencga_config=os.path.join(dirname, 'opencga.json'),
-                    vcf_types_config=os.path.join(dirname, 'vcf_types.tsv'))
+    htsget = Htsget(opencga_config='./opencga.json',
+                    vcf_types_config='./vcf_types.tsv')
     htsget.start()
 
 

@@ -1,15 +1,48 @@
+##
+## Copyright (c) 2016-2019 Genomics England Ltd.
+##
+## This file is part of the Genomics England implementation of the HTSGET protocol
+## 
+##
+## Licensed to the Apache Software Foundation (ASF) under one
+## or more contributor license agreements.  See the NOTICE file
+## distributed with this work for additional information
+## regarding copyright ownership.  The ASF licenses this file
+## to you under the Apache License, Version 2.0 (the
+## "License"); you may not use this file except in compliance
+## with the License.  You may obtain a copy of the License at
+##
+##   http://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing,
+## software distributed under the License is distributed on an
+## "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+## KIND, either express or implied.  See the License for the
+## specific language governing permissions and limitations
+## under the License.
+##
+import logging
 import os
 import sys
 import json
+import inspect
+
+import os.path
+
 import yaml
 from tempfile import NamedTemporaryFile
 from tornado import ioloop, web
 from pyCGA.opencgarestclients import OpenCGAClient
 from pysam import AlignmentFile, VariantFile
+from tornado.options import options, define
+import tornado
 
 _READS_FORMAT = ['BAM']
 _VARIANTS_FORMAT = ['VCF']
+_OPENCGA_CONF = os.getenv('OPENCGA_CONF', './opencga.json')
+_VCF_TYPES = os.getenv('VCF_TYPES', './vcf_types.tsv')
 
+define("port", default=8888, help="run on the given port", type=int)
 
 class OpenCGAConfigHandler:
     def __init__(self, config_fpath):
@@ -94,6 +127,7 @@ class BaseHandler(web.RequestHandler):
         # self.set_header('Content-Type', 'application/json')
         try:
             error, msg = self._reason.split('::')
+            print(error+" "+msg)
         except Exception, e:
             error, msg = self._reason, e.message
 
@@ -114,7 +148,7 @@ class BaseHandler(web.RequestHandler):
         return sid
 
     def _opencga_login(self, username=None, password=None, auth_token=None):
-        if not (username and (password or auth_token)):
+        if not ((password or auth_token)):
             msg = 'Username/password or username/token not provided'
             raise web.HTTPError(reason='InvalidAuthentication::' + msg,
                                 status_code=401)
@@ -131,6 +165,12 @@ class BaseHandler(web.RequestHandler):
                                         user=username,
                                         session_id=session_id,
                                         auto_refresh=False)
+            elif not(username) and auth_token:
+                session_id = self._get_session_id(auth_token)
+                self.oc = OpenCGAClient(configuration=self.opencga_config,
+                                        session_id=session_id,
+                                        auto_refresh=False)
+
         except Exception, e:
             try:
                 msg = json.loads(e.message)['error']
@@ -271,6 +311,8 @@ class LoginHandler(BaseHandler):
         super(LoginHandler, self).__init__(application, request, **kwargs)
 
     def post(self):
+
+        print(self.request.arguments)
         username = self.get_argument('username', '')
         password = self.get_argument('password', '')
 
@@ -283,6 +325,9 @@ class LoginHandler(BaseHandler):
         else:
             self._opencga_login(username=username, password=password)
             self.write({'sessionId': self.oc.session_id})
+
+    def head(self):
+        self.finish()
 
 
 class RefreshTokenHandler(BaseHandler):
@@ -335,6 +380,9 @@ class ReadsHandler(BaseHandler):
         )
         self.write(response)
 
+    def head(self):
+        self.finish()
+
 
 class ReadsByPathHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
@@ -356,6 +404,8 @@ class ReadsByPathHandler(BaseHandler):
             **{'attributes.gelStatus': 'READY'}
         )['id']
 
+        logging.info('User {} asked for BAM Id: {}'.format(self.username, bam_id))
+
         # Getting coordinates
         ref, start, end = self._get_coordinates(args)
         self._check_ref(self.endpoint, study, bam_id, ref)
@@ -366,6 +416,9 @@ class ReadsByPathHandler(BaseHandler):
             self.auth_token, self.username
         )
         self.write(response)
+
+    def head(self):
+        self.finish()
 
 
 class VariantsHandler(BaseHandler):
@@ -413,6 +466,9 @@ class VariantsHandler(BaseHandler):
         )
         self.write(response)
 
+    def head(self):
+        self.finish()
+
 
 class VariantsByPathHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
@@ -446,6 +502,9 @@ class VariantsByPathHandler(BaseHandler):
         )
         self.write(response)
 
+    def head(self):
+        self.finish()
+
 
 class DataHandler(BaseHandler):
     def __init__(self, application, request, **kwargs):
@@ -469,8 +528,13 @@ class DataHandler(BaseHandler):
         file_uri = self._get_file_info(
             study=args['study'], file_id=args['fileId']
         )['uri'].replace('file://', '')
+        logging.info("Seeking file "+file_uri)
 
         ref, start, end = self._get_coordinates(args)
+
+        if not os.path.isfile(file_uri):
+            raise web.HTTPError(log_message="No such file",reason="File does not exist on system :"+file_uri,
+                                status_code=404)
 
         # Getting file data
         if args['format'] in _READS_FORMAT:
@@ -490,29 +554,48 @@ class DataHandler(BaseHandler):
             vcffile_in.close()
             vcffile_out.close()
 
-        # Data blocks should not exceed ~1GB
-        with open(self.ntf.name, 'rb') as f:
-            while True:
-                data = f.read(self._buf_size)
-                if not data:
-                    break
-                self.write(data)
+        if not os.path.exists(self.ntf.name):
+            raise web.HTTPError(reason="File does not exist on system :"+file_uri, status_code=404)
 
-        os.remove(self.ntf.name)
+        # Data blocks should not exceed ~1GB
+        try:
+            with open(self.ntf.name, 'rb') as f:
+                while True:
+                    data = f.read(self._buf_size)
+                    if not data:
+                        break
+                    self.write(data)
+
+            os.remove(self.ntf.name)
+        except:
+            logging.warnings(self.ntf.name+" has issues on the file system")
+
+    def head(self):
+        self.finish()
+
+
+class HealthHandler(tornado.web.RequestHandler):
+
+    def head(self):
+        self.finish()
+
+    def post(self):
+        self.finish()
+
+    def get(self):
+        self.finish()
+
+    get = post
 
 
 class Htsget:
-    def __init__(self, opencga_config, vcf_types_config=None):
 
-        opencga_config = OpenCGAConfigHandler(opencga_config).get_configuration()
-
-        vcf_types = None
-        if vcf_types_config is not None:
-            vcf_types = VCFTypeConfig(vcf_types_config).get_vcf_types()
-
-        self.application = web.Application([
+    def make_app(self,opencga_config,vcf_types):
+        return tornado.web.Application([
             (r'/user/login', LoginHandler,
              dict(opencga_config=opencga_config)),
+            (r'/health', HealthHandler),
+            (r'/', HealthHandler),
             (r'/user/refresh-token', RefreshTokenHandler,
              dict(opencga_config=opencga_config)),
             (r'/reads/(?!bypath)(.*)/(.*)', ReadsHandler,
@@ -528,7 +611,36 @@ class Htsget:
             (r'/data', DataHandler,
              dict(opencga_config=opencga_config))
         ])
-        self.application.listen(8888)
+
+    def __init__(self, opencga_config, vcf_types_config=None):
+
+        opencga_config = OpenCGAConfigHandler(opencga_config).get_configuration()
+
+        vcf_types = None
+        if vcf_types_config is not None:
+            vcf_types = VCFTypeConfig(vcf_types_config).get_vcf_types()
+
+        self.application = web.Application([
+            (r'/user/login', LoginHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/health', HealthHandler),
+            (r'/', HealthHandler),
+            (r'/user/refresh-token', RefreshTokenHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/reads/(?!bypath)(.*)/(.*)', ReadsHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/reads/bypath/(.*)/(.*)', ReadsByPathHandler,
+             dict(opencga_config=opencga_config)),
+            (r'/variants/(?!bypath)(.*)/(.*)/(.*)', VariantsHandler,
+             dict(opencga_config=opencga_config, vcf_types=vcf_types) if vcf_types
+             else dict(opencga_config=opencga_config)),
+            (r'/variants/bypath/(.*)/(.*)', VariantsByPathHandler,
+             dict(opencga_config=opencga_config)),
+            # TODO data endpoint should be https
+            (r'/data', DataHandler,
+             dict(opencga_config=opencga_config))
+        ])
+
 
     @staticmethod
     def start():
@@ -540,8 +652,9 @@ class Htsget:
 
 
 def main():
-    htsget = Htsget(opencga_config='./opencga.json',
-                    vcf_types_config='./vcf_types.tsv')
+    options.parse_command_line()
+    htsget = Htsget(opencga_config=_OPENCGA_CONF, vcf_types_config=_VCF_TYPES)
+    htsget.application.listen(options.port)
     htsget.start()
 
 
